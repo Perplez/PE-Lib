@@ -1,3 +1,4 @@
+
 #include <windows.h>
 typedef struct tagImportTableInfo{
     DWORD NumberOfImports;
@@ -120,44 +121,56 @@ int WINAPI FindRVAAddress(unsigned char *ImageBase, DWORD Address){
     return 0;
 }
 int WINAPI AddFunctionToImage(HANDLE hInitialFile, const char *FunctionName, const char *DllName){
-    unsigned char *MappedFile, *PESignature, *NewImportTable, *ImportTable;
+    unsigned char *MappedFile, *PESignature, *ImportTable;
+    PIMAGE_IMPORT_DESCRIPTOR NewImportTable;
     BY_HANDLE_FILE_INFORMATION FileInfo;
-    DWORD Padding, SizeOfFinalIAT;
-    Padding = 0;
-    PPE_INFORMATION PEInformation = (PPE_INFORMATION)VirtualAlloc(0, sizeof(PE_INFORMATION), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    PIMAGE_SECTION_HEADER AddedSection;
+    DWORD Padding, SizeOfFinalIAT, AddBytes;
+    AddBytes = Padding = 0;
+    HANDLE hMap;
+    PPE_INFORMATION PEInformation;
+    PEInformation = (PPE_INFORMATION)VirtualAlloc(0, sizeof(PE_INFORMATION), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (GetFileInformationByHandle(hInitialFile, &FileInfo) == 0) return 0;
-    HANDLE hMap = CreateFileMappingA(hInitialFile, NULL, PAGE_READWRITE | SEC_COMMIT, NULL, FileInfo.nFileSizeLow, NULL);
-    MappedFile = (unsigned char *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, NULL, NULL, NULL);
+    hMap = CreateFileMappingA(hInitialFile, NULL, PAGE_READWRITE | SEC_COMMIT, NULL, FileInfo.nFileSizeLow, NULL);
+    ImportTable = PESignature = MappedFile = (unsigned char *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, NULL, NULL, NULL);
     ParseRawImage(MappedFile, PEInformation);
-    AddedSection = AddSectionToImage(MappedFile, ".pwned", SizeOfFinalIAT, SizeOfFinalIAT,
-    IMAGE_SCN_ALIGN_4BYTES | IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
-    UnmapViewOfFile((LPCVOID)MappedFile);
-    CloseHandle(hMap);
-    hMap = CreateFileMappingA(hInitialFile, NULL, PAGE_READWRITE | SEC_COMMIT, NULL, FileInfo.nFileSizeLow + AddedSection->SizeOfRawData, NULL);
-    MappedFile = (unsigned char *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, NULL, NULL, NULL);
-    PESignature = MappedFile + *(DWORD *)(MappedFile + 0x3c);
+    PESignature += *(DWORD *)(MappedFile + 0x3c);
+    NewImportTable = (PIMAGE_IMPORT_DESCRIPTOR)(MappedFile +  PEInformation->Sections[PEInformation->NumberOfSections - 1]->PointerToRawData + PEInformation->Sections[PEInformation->NumberOfSections - 1]->Misc.VirtualSize);
+    ImportTable = (unsigned char *)NewImportTable;
     SizeOfFinalIAT = 0x14 * PEInformation->NumberOfImportDescriptors;
-    if (SizeOfFinalIAT % 2 != NULL) Padding++;
+    if ((strlen(FunctionName) + 1) % 2) Padding = 1;
     SizeOfFinalIAT += 0x14 * 2 + 8 + 2 + strlen(FunctionName) + 1 + Padding + strlen(DllName) + 1;
-    ImportTable = NewImportTable = MappedFile + AddedSection->PointerToRawData;
-    *(DWORD *)(PESignature + 0x80) = FindRVAAddress(MappedFile, NewImportTable - MappedFile);
-    *(DWORD *)(PESignature + 0x84) = 0x14 * 2 + 0x14 * PEInformation->NumberOfImportDescriptors;
+    PEInformation->Sections[PEInformation->NumberOfSections - 1]->Misc.VirtualSize += SizeOfFinalIAT;
+    for (int i = 1, OldRaw = PEInformation->Sections[PEInformation->NumberOfSections - 1]->SizeOfRawData;;i++){
+        if ((PEInformation->Sections[PEInformation->NumberOfSections - 1]->Misc.VirtualSize) > PEInformation->OptionalHeader->FileAlignment * i) continue;
+        PEInformation->Sections[PEInformation->NumberOfSections - 1]->SizeOfRawData = PEInformation->OptionalHeader->FileAlignment * i;
+        if (OldRaw == PEInformation->Sections[PEInformation->NumberOfSections - 1]->SizeOfRawData) break;
+        PEInformation->OptionalHeader->SizeOfImage += PEInformation->OptionalHeader->FileAlignment * i;
+        AddBytes = PEInformation->OptionalHeader->FileAlignment * i;
+        break;
+    }
     memset(NewImportTable, '\0', SizeOfFinalIAT);
+    memcpy(NewImportTable, PEInformation->ImportDescriptor[0]->ImportInfo, PEInformation->NumberOfImportDescriptors * 0x14);
+    NewImportTable = &NewImportTable[PEInformation->NumberOfImportDescriptors];
     ImportTable += SizeOfFinalIAT;
-    memcpy(NewImportTable, PEInformation->ImportDescriptor[0]->ImportInfo, 0x14 * PEInformation->NumberOfImportDescriptors);
-    NewImportTable += 0x14 * PEInformation->NumberOfImportDescriptors;
     ImportTable -= strlen(DllName) + 1;
     memcpy(ImportTable, DllName, strlen(DllName) + 1);
-    *(DWORD *)(NewImportTable + 0xc) = FindRVAAddress(MappedFile, ImportTable - MappedFile);
+    NewImportTable->Name = FindRVAAddress(MappedFile, ImportTable - MappedFile);
     ImportTable -= 2 + strlen(FunctionName) + 1 + Padding;
-    memcpy(ImportTable + 2, FunctionName, strlen(FunctionName) + 1 + Padding);
+    memcpy(ImportTable + 2, FunctionName, strlen(FunctionName) + 1);
     *(DWORD *)(ImportTable - 8) = FindRVAAddress(MappedFile, ImportTable - MappedFile);
     ImportTable -= 8;
-    *(DWORD *)(NewImportTable + 0x10) = FindRVAAddress(MappedFile, ImportTable - MappedFile);
+    NewImportTable->FirstThunk = FindRVAAddress(MappedFile, ImportTable - MappedFile);
+    ImportTable -= 0x14 * 2 + 0x14 * PEInformation->NumberOfImportDescriptors;
+    PEInformation->OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = FindRVAAddress(MappedFile, ImportTable - MappedFile);
+    PEInformation->OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = 0x14 * 2 + 0x14 * PEInformation->NumberOfImportDescriptors;
+    if (AddBytes != 0){
+        UnmapViewOfFile(MappedFile);
+        CloseHandle(hMap);
+        hMap = CreateFileMappingA(hInitialFile, NULL, PAGE_READWRITE | SEC_COMMIT, NULL, FileInfo.nFileSizeLow + AddBytes, NULL);
+        MappedFile = (unsigned char *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, NULL, NULL, NULL);
+    }
     UnParseRawImage(PEInformation);
-    VirtualFree(AddedSection, 0x24, MEM_DECOMMIT);
     UnmapViewOfFile(MappedFile);
     CloseHandle(hMap);
-    return 0;
+    return TRUE;
 }
