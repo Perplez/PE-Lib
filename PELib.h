@@ -1,5 +1,7 @@
-
 #include <windows.h>
+#include <imagehlp.h>
+#define ARG_FLAG_INT 1
+#define ARG_FLAG_POINTER 2
 typedef struct tagImportTableInfo{
     DWORD NumberOfImports;
     PIMAGE_IMPORT_DESCRIPTOR ImportInfo;
@@ -16,6 +18,7 @@ int UnParseRawImage(PPE_INFORMATION PEInformation);
 int WINAPI FindRawAddress(unsigned char *ImageBase, DWORD Address);
 int WINAPI FindRVAAddress(unsigned char *ImageBase, DWORD RVAAddress);
 int WINAPI AddFunctionToImage(HANDLE hInitialFile);
+PIMAGE_SECTION_HEADER AddSectionToImage(unsigned char *ImageBase, const char *NameOfSection, DWORD VirtualSize, DWORD RawSize);
 int WINAPI ParseRawImage(unsigned char *ImageBase, PPE_INFORMATION PEInformation){
     unsigned char *PESignature, *ImportTable, *SectionEntry, *ThunkTable;
     PESignature = ImportTable = ImageBase;
@@ -41,7 +44,6 @@ int WINAPI ParseRawImage(unsigned char *ImageBase, PPE_INFORMATION PEInformation
     }
     return TRUE;
 }
-PIMAGE_SECTION_HEADER AddSectionToImage(unsigned char *ImageBase, const char *NameOfSection, DWORD VirtualSize, DWORD RawSize);
 PIMAGE_SECTION_HEADER AddSectionToImage(unsigned char *ImageBase, const char *NameOfSection, DWORD VirtualSize, DWORD RawSize, DWORD Flags){
     unsigned char *PESignature = ImageBase, *SectionEntry;
     PIMAGE_OPTIONAL_HEADER32 OptionalHeader;
@@ -122,16 +124,26 @@ int WINAPI FindRVAAddress(unsigned char *ImageBase, DWORD Address){
 }
 int WINAPI AddFunctionToImage(HANDLE hInitialFile, const char *FunctionName, const char *DllName){
     unsigned char *MappedFile, *PESignature, *ImportTable;
+    DWORD OldCheckSum = 0, NewCheckSum = 0;
     PIMAGE_IMPORT_DESCRIPTOR NewImportTable;
     BY_HANDLE_FILE_INFORMATION FileInfo;
-    DWORD Padding, SizeOfFinalIAT, AddBytes;
-    AddBytes = Padding = 0;
+    DWORD Padding, SizeOfFinalIAT, AddBytes, Err;
+    Err = AddBytes = Padding = 0;
     HANDLE hMap;
     PPE_INFORMATION PEInformation;
     PEInformation = (PPE_INFORMATION)VirtualAlloc(0, sizeof(PE_INFORMATION), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (PEInformation == NULL) return FALSE;
     if (GetFileInformationByHandle(hInitialFile, &FileInfo) == 0) return 0;
     hMap = CreateFileMappingA(hInitialFile, NULL, PAGE_READWRITE | SEC_COMMIT, NULL, FileInfo.nFileSizeLow, NULL);
+    if (hMap == NULL){
+        Err = GetLastError();
+        goto label_1;
+    }
     ImportTable = PESignature = MappedFile = (unsigned char *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, NULL, NULL, NULL);
+    if (MappedFile == NULL){
+        Err = GetLastError();
+        goto label_2;
+    }
     ParseRawImage(MappedFile, PEInformation);
     PESignature += *(DWORD *)(MappedFile + 0x3c);
     NewImportTable = (PIMAGE_IMPORT_DESCRIPTOR)(MappedFile +  PEInformation->Sections[PEInformation->NumberOfSections - 1]->PointerToRawData + PEInformation->Sections[PEInformation->NumberOfSections - 1]->Misc.VirtualSize);
@@ -163,14 +175,25 @@ int WINAPI AddFunctionToImage(HANDLE hInitialFile, const char *FunctionName, con
     ImportTable -= 0x14 * 2 + 0x14 * PEInformation->NumberOfImportDescriptors;
     PEInformation->OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = FindRVAAddress(MappedFile, ImportTable - MappedFile);
     PEInformation->OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = 0x14 * 2 + 0x14 * PEInformation->NumberOfImportDescriptors;
+    PEInformation->Sections[PEInformation->NumberOfSections - 1]->Characteristics |= IMAGE_SCN_MEM_WRITE;
     if (AddBytes != 0){
         UnmapViewOfFile(MappedFile);
         CloseHandle(hMap);
         hMap = CreateFileMappingA(hInitialFile, NULL, PAGE_READWRITE | SEC_COMMIT, NULL, FileInfo.nFileSizeLow + AddBytes, NULL);
         MappedFile = (unsigned char *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, NULL, NULL, NULL);
+        FileInfo.nFileSizeLow += AddBytes;
     }
+    CheckSumMappedFile(MappedFile, FileInfo.nFileSizeLow, &OldCheckSum, &NewCheckSum);
+    PEInformation->OptionalHeader->CheckSum = NewCheckSum;
     UnParseRawImage(PEInformation);
     UnmapViewOfFile(MappedFile);
+    label_2:
     CloseHandle(hMap);
+    label_1:
+    VirtualFree(PEInformation, sizeof(PE_INFORMATION), MEM_DECOMMIT);
+    if (Err != ERROR_SUCCESS) {
+        SetLastError(Err);
+        return 0;
+    }
     return TRUE;
 }
